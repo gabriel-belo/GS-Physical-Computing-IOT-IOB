@@ -1,89 +1,151 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
-# Função vazia obrigatória para o createTrackbar
 def nothing(x):
     pass
 
-# Captura do vídeo
-video = cv2.VideoCapture('queimadas4.mp4')
+video = cv2.VideoCapture('queimadas1.mp4')
 
-# Cria a janela de controle
-cv2.namedWindow("Calibragem HSV")
 
-# Cria as 6 barras (H, S, V mínimo e máximo)
-cv2.createTrackbar("H Min", "Calibragem HSV", 0, 179, nothing)
-cv2.createTrackbar("S Min", "Calibragem HSV", 0, 255, nothing)
-cv2.createTrackbar("V Min", "Calibragem HSV", 0, 255, nothing)
-cv2.createTrackbar("H Max", "Calibragem HSV", 179, 179, nothing)
-cv2.createTrackbar("S Max", "Calibragem HSV", 255, 255, nothing)
-cv2.createTrackbar("V Max", "Calibragem HSV", 255, 255, nothing)
+# cv2.namedWindow("Calibragem")
+# cv2.createTrackbar("Area Min",    "Calibragem", 500,  50000, nothing)
+# cv2.createTrackbar("Solidez Min", "Calibragem", 50,   100,   nothing)
 
-def drawRectangle(frame, bbox):
-    p1 = (int(bbox[0]), int(bbox[1]))
-    p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
-    cv2.rectangle(frame, p1, p2, (255,0,0), 2, 1)
+def build_fire_mask(frame):
+    """
+    Combina três critérios para detectar fogo de forma robusta:
+    1. Faixa HSV de chama (laranja/amarelo/vermelho)
+    2. Núcleo branco/claro (alta luminosidade, baixa saturação)
+    3. Dominância do canal vermelho no espaço BGR
+    """
+    blurred = cv2.GaussianBlur(frame, (11, 11), 0)
+    hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-def displayRectangle(frame, bbox):
-    plt.figure(figsize=(20,10))
-    frameCopy = frame.copy()
-    drawRectangle(frameCopy, bbox)
-    frameCopy = cv2.cvtColor(frameCopy, cv2.COLOR_RGB2BGR)
-    plt.imshow(frameCopy); plt.axis('off')    
+    # ── Critério 1: faixa HSV de chama ───────────────────────────────────────
+    # Vermelho "baixo" (H próximo de 0 e de 179, pois é circular)
+    lower_fire1 = np.array([0,   50, 50])
+    upper_fire1 = np.array([35, 255, 255])
+    mask_hsv1   = cv2.inRange(hsv, lower_fire1, upper_fire1)
 
-def drawText(frame, txt, location, color = (50,170,50)):
-    cv2.putText(frame, txt, location, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+    # Vermelho "alto" (H perto de 170–179 = vermelho vivo/âmbar escuro)
+    lower_fire2 = np.array([170, 50, 50])
+    upper_fire2 = np.array([179, 255, 255])
+    mask_hsv2   = cv2.inRange(hsv, lower_fire2, upper_fire2)
+
+    mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
+
+    # ── Critério 2: núcleo branco/claro da chama ─────────────────────────────
+    # Alta luminosidade + baixa saturação = núcleo quase branco
+    lower_core = np.array([0,   0, 200])
+    upper_core = np.array([35, 80, 255])
+    mask_core  = cv2.inRange(hsv, lower_core, upper_core)
+
+    # ── Critério 3: dominância do canal vermelho (R > G > B) ─────────────────
+    b, g, r = cv2.split(blurred)
+    # R maior que G e G maior que B (pelo menos por margem)
+    mask_rgb = cv2.bitwise_and(
+        cv2.compare(r, g, cv2.CMP_GT),   # R > G
+        cv2.compare(g, b, cv2.CMP_GT)    # G > B
+    )
+    # Exige também que R seja suficientemente brilhante (evita pixels escuros)
+    _, mask_brightness = cv2.threshold(r, 100, 255, cv2.THRESH_BINARY)
+    mask_rgb = cv2.bitwise_and(mask_rgb, mask_brightness)
+
+    # ── Combinação: (HSV OR núcleo) AND dominância RGB ───────────────────────
+    mask_color = cv2.bitwise_or(mask_hsv, mask_core)
+    mask_final = cv2.bitwise_and(mask_color, mask_rgb)
+
+    # ── Limpeza morfológica ───────────────────────────────────────────────────
+    kernel_open  = np.ones((5, 5),  np.uint8)   # remove ruído pequeno
+    kernel_close = np.ones((25, 25), np.uint8)  # fecha buracos grandes
+    mask_final = cv2.morphologyEx(mask_final, cv2.MORPH_OPEN,  kernel_open)
+    mask_final = cv2.morphologyEx(mask_final, cv2.MORPH_CLOSE, kernel_close)
+
+    return mask_final, mask_hsv, mask_rgb
+
+def is_fire_contour(c, area_min, solidity_min):
+    """
+    Filtra contornos por:
+    - Área mínima
+    - Solidez (contorno / convex hull) — chamas têm ~0.5–0.9
+    - Aspect ratio — chamas tendem a ser mais altas que largas
+    """
+    area = cv2.contourArea(c)
+    if area < area_min:
+        return False
+
+    hull_area = cv2.contourArea(cv2.convexHull(c))
+    if hull_area == 0:
+        return False
+
+    solidity = area / hull_area  # 0.0–1.0
+    if solidity < solidity_min / 100.0:
+        return False
+
+    # Aspect ratio: chamas não costumam ser perfeitamente quadradas
+    _, _, w, h = cv2.boundingRect(c)
+    aspect = h / w if w > 0 else 0
+    if aspect < 0.3 or aspect > 10:  # descarta extremos
+        return False
+
+    return True
 
 while True:
     ok, frame = video.read()
-    
+
     if not ok:
         video.set(cv2.CAP_PROP_POS_FRAMES, 0)
         continue
 
-    #Pré-processamento
-    # 1. Blur para reduzir ruído
-    blurred = cv2.GaussianBlur(frame, (11, 11), 0)
-    
-    # 2. Conversão para HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    # Pega os valores das barras em tempo real
-    h_min = cv2.getTrackbarPos("H Min", "Calibragem HSV")
-    s_min = cv2.getTrackbarPos("S Min", "Calibragem HSV")
-    v_min = cv2.getTrackbarPos("V Min", "Calibragem HSV")
-    h_max = cv2.getTrackbarPos("H Max", "Calibragem HSV")
-    s_max = cv2.getTrackbarPos("S Max", "Calibragem HSV")
-    v_max = cv2.getTrackbarPos("V Max", "Calibragem HSV")
+    area_min    = cv2.getTrackbarPos("Area Min",    "Calibragem")
+    solidity_min = cv2.getTrackbarPos("Solidez Min", "Calibragem")
 
-    # Definir limites da cor do fogo (laranja/amarelo) no espaço HSV
-    # lower_fire = np.array([18, 50, 50])
-    # upper_fire = np.array([35, 255, 255])
-    lower_fire = np.array([h_min, s_min, v_min])
-    upper_fire = np.array([h_max, s_max, v_max])
+    mask_final, mask_hsv, mask_rgb = build_fire_mask(frame)
 
-    # 3. Máscara com seus limites (ajustados via Trackbar)
-    mask = cv2.inRange(hsv, lower_fire, upper_fire)
-    
-    # 4. Morfologia para limpar a máscara (Essencial!)
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel) # Remove ruído
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel) # Preenche buracos
+    contours, _ = cv2.findContours(
+        mask_final, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    # 5. Find Contours na máscara já limpa
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contours:
-        if cv2.contourArea(cnt) > 500: # Filtra ruídos pequenos
-            x, y, w, h = cv2.boundingRect(cnt)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(frame, "FOGO DETECTADO", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+    display = frame.copy()
+    fire_detected = False
 
-    cv2.imshow('Monitoramento de Queimadas', frame)
-    cv2.imshow('Mascara (O que o computador ve)', mask)
+    for c in contours:
+        if not is_fire_contour(c, area_min, solidity_min):
+            continue
 
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+        fire_detected = True
+        hull = cv2.convexHull(c)
+
+        # Contorno interno (verde) e hull externo (azul)
+        cv2.drawContours(display, [c],    -1, (0, 255, 0),   1)
+        cv2.drawContours(display, [hull], -1, (255, 200, 0), 2)
+
+        # Bounding box com label
+        x, y, w, h = cv2.boundingRect(c)
+        area = cv2.contourArea(c)
+        cv2.rectangle(display, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.putText(display, f"FOGO  area={int(area)}",
+                    (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 0, 255), 2)
+
+    # Alerta geral
+    if fire_detected:
+        cv2.putText(display, "INCENDIO DETECTADO",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.2, (0, 0, 255), 3)
+
+    # Overlay da máscara final sobre o frame (semi-transparente, em laranja)
+    overlay = display.copy()
+    overlay[mask_final > 0] = (0, 140, 255)
+    display = cv2.addWeighted(display, 0.75, overlay, 0.25, 0)
+
+    cv2.imshow("Deteccao de Fogo", display)
+    cv2.imshow("Mascara Final",    mask_final)
+    cv2.imshow("Mascara HSV",      mask_hsv)
+    cv2.imshow("Mascara RGB",      mask_rgb)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
 video.release()
 cv2.destroyAllWindows()
