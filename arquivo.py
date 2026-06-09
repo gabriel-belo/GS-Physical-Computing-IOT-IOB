@@ -4,12 +4,12 @@ import numpy as np
 def nothing(x):
     pass
 
-video = cv2.VideoCapture('queimadas1.mp4')
+video = cv2.VideoCapture('queimadas2.mp4')
 
 
-# cv2.namedWindow("Calibragem")
-# cv2.createTrackbar("Area Min",    "Calibragem", 500,  50000, nothing)
-# cv2.createTrackbar("Solidez Min", "Calibragem", 50,   100,   nothing)
+cv2.namedWindow("Calibragem")
+cv2.createTrackbar("Area Min",    "Calibragem", 500,  50000, nothing)
+cv2.createTrackbar("Solidez Min", "Calibragem", 50,   100,   nothing)
 
 def build_fire_mask(frame):
     """
